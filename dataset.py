@@ -6,8 +6,14 @@ from PIL import Image
 
 class CocoDataset(Dataset):
 
-    def __init__(self, dataset_folder, dataset_type, transform_x=None, transform_y=None):
-
+    def __init__(self, dataset_folder, dataset_type, transform_x=None, transform_y=None, frac=1.0):
+        """
+        :param dataset_folder: path to the dataset folder
+        :param dataset_type: train, val or test split
+        :param transform_x: transform to apply to the input image
+        :param transform_y: transform to apply to the target image
+        :param frac: fraction of the dataset to use
+        """
         # parameters value check dataset_type: map train, val, test to train2017, val2017, test2017
         if dataset_type == 'train':
             dataset_type = 'train2017'
@@ -21,6 +27,7 @@ class CocoDataset(Dataset):
         self.path = os.path.join(dataset_folder, dataset_type)
         self.transform_x = transform_x
         self.transform_y = transform_y
+        self.frac = frac
 
         self.images = []
 
@@ -30,7 +37,7 @@ class CocoDataset(Dataset):
                 self.images.append(os.path.join(self.path, file))
 
     def __len__(self):
-        return len(self.images)
+        return int(len(self.images)*self.frac)
 
     def __getitem__(self, idx):
         # load image
