@@ -111,34 +111,49 @@ class Trainer:
     def _train_step(self, batch):
         """
         Performs a single training step
-        :param batch: A batch of training images
+        :param batch: A batch of training images, (gray, color)
         :return: Generator loss, Discriminator loss
         """
         self.generator.train()
         self.discriminator.train()
 
-        # random seed as input for generator
-        noise = torch.randn([self.options['batch_size'], self.options['latent_dim']],
-                            device=self.device)
+        # get images from batch
+        input_imgs, target_imgs = batch
 
         # generate fake images
-        fake_images = self.generator(noise)
-
-        # get discriminator predictions for real and fake images
-        real_preds = self.discriminator(batch)
-        fake_preds = self.discriminator(fake_images.detach())
+        fake_images = self.generator(input_imgs)
 
         # train discriminator
-        disc_loss = self.disc_criterion(real_preds, fake_preds, self.device)
+
         self.disc_optimizer.zero_grad()
+        # combine input images and fake images
+        fake_images_to_disc = torch.cat([input_imgs, fake_images], dim=1)
+        # get discriminator predictions for fake images
+        fake_preds = self.discriminator(fake_images_to_disc.detach())
+        # combine input images and real images
+        real_images_to_disc = torch.cat([input_imgs, target_imgs], dim=1)
+        # get discriminator predictions for real images
+        real_preds = self.discriminator(real_images_to_disc)
+        # calculate discriminator loss
+        disc_loss = self.disc_criterion(fake_preds, real_preds, self.device)
+        # backpropagate discriminator loss
         disc_loss.backward()
+        # update discriminator weights
         self.disc_optimizer.step()
 
         # train generator
-        fake_preds = self.discriminator(fake_images)
-        gen_loss = self.gen_criterion(fake_preds, self.device)
+
         self.gen_optimizer.zero_grad()
+        # combine input images and fake images
+        fake_images_to_disc = torch.cat([input_imgs, fake_images], dim=1)
+        with torch.no_grad():
+            # get discriminator predictions for fake images
+            fake_preds = self.discriminator(fake_images_to_disc)
+        # calculate generator loss
+        gen_loss = self.gen_criterion(fake_preds, target_imgs, fake_images, self.device)
+        # backpropagate generator loss
         gen_loss.backward()
+        # update generator weights
         self.gen_optimizer.step()
 
         return gen_loss, disc_loss
@@ -150,25 +165,31 @@ class Trainer:
         :return: Generator loss, Discriminator loss
         """
 
+        # TODO: in the paper they use train mode also for validation
+        #  (Dropout and BatchNorm in place of noise)
         self.generator.eval()
         self.discriminator.eval()
 
+        # get images from batch
+        input_imgs, target_imgs = batch
+
         with torch.no_grad():
 
-            # random seed as input for generator
-            noise = torch.randn([self.options['batch_size'], self.options['latent_dim']],
-                                device=self.device)
-
             # generate fake images
-            fake_images = self.generator(noise)
+            fake_images = self.generator(input_imgs)
 
-            # get discriminator predictions for real and fake images
-            real_preds = self.discriminator(batch)
-            fake_preds = self.discriminator(fake_images)
-
-            # compute discriminator and generator losses
-            disc_loss = self.disc_criterion(real_preds, fake_preds, self.device)
-            gen_loss = self.gen_criterion(fake_preds, self.device)
+            # combine input images and fake images
+            fake_images_to_disc = torch.cat([input_imgs, fake_images], dim=1)
+            # get discriminator predictions for fake images
+            fake_preds = self.discriminator(fake_images_to_disc)
+            # combine input images and real images
+            real_images_to_disc = torch.cat([input_imgs, target_imgs], dim=1)
+            # get discriminator predictions for real images
+            real_preds = self.discriminator(real_images_to_disc)
+            # calculate discriminator loss
+            disc_loss = self.disc_criterion(fake_preds, real_preds, self.device)
+            # calculate generator loss
+            gen_loss = self.gen_criterion(fake_preds, target_imgs, fake_images, self.device)
 
         return gen_loss, disc_loss
 
