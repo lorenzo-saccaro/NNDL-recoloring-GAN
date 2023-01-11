@@ -2,29 +2,33 @@ import os
 import time
 from utils import format_time
 from tqdm import tqdm
-
 import torch
 
 
 class Checkpoint:
 
-    def __init__(self, generator, discriminator, gen_optimizer, disc_optimizer, path):
+    def __init__(self, generator, discriminator, gen_optimizer, disc_optimizer, gen_scheduler,
+                 disc_scheduler, path):
         """
         :param generator: Generator model
         :param discriminator: Discriminator model
         :param gen_optimizer: Generator optimizer
         :param disc_optimizer: Discriminator optimizer
+        :param gen_scheduler: Generator lr scheduler
+        :param disc_scheduler: Discriminator lr scheduler
         :param path: checkpoint file path
         """
         self.generator = generator
         self.discriminator = discriminator
         self.gen_optimizer = gen_optimizer
         self.disc_optimizer = disc_optimizer
+        self.gen_scheduler = gen_scheduler
+        self.disc_scheduler = disc_scheduler
         self.path = path
 
     def load(self):
         """
-        Loads the generator, discriminator, optimizers states and history from the checkpoint file.
+        Loads the generator, discriminator, optimizers and schedulers states and history from the checkpoint file.
         :return: history if checkpoint exists, else None
         """
         if os.path.exists(self.path):
@@ -38,6 +42,12 @@ class Checkpoint:
             print("Generator optimizer loaded")
             self.disc_optimizer.load_state_dict(checkpoint['disc_optimizer'])
             print("Discriminator optimizer loaded")
+            if self.gen_scheduler is not None:
+                self.gen_scheduler.load_state_dict(checkpoint['gen_scheduler'])
+                print("Generator scheduler loaded")
+            if self.disc_scheduler is not None:
+                self.disc_scheduler.load_state_dict(checkpoint['disc_scheduler'])
+                print("Discriminator scheduler loaded")
             return checkpoint['history']
         else:
             print("No checkpoint found at {}".format(self.path))
@@ -46,7 +56,7 @@ class Checkpoint:
 
     def save(self, history):
         """
-        Saves the generator, discriminator, optimizers states and history from the checkpoint file.
+        Saves the generator, discriminator, optimizers and schedulers states and history to the checkpoint file.
         :param history: a dictionary containing the training and validation metrics
         :return:
         """
@@ -56,6 +66,8 @@ class Checkpoint:
             'discriminator': self.discriminator.state_dict(),
             'gen_optimizer': self.gen_optimizer.state_dict(),
             'disc_optimizer': self.disc_optimizer.state_dict(),
+            'gen_scheduler': self.gen_scheduler.state_dict() if self.gen_scheduler is not None else None,
+            'disc_scheduler': self.disc_scheduler.state_dict() if self.disc_scheduler is not None else None,
             'history': history
         }, self.path)
         print("Checkpoint saved")
@@ -71,13 +83,16 @@ class Checkpoint:
 
 
 class Trainer:
-    def __init__(self, generator, discriminator, gen_optimizer, disc_optimizer, gen_criterion,
-                 disc_criterion, device, train_loader, val_loader, options):
+    def __init__(self, generator, discriminator, gen_optimizer, disc_optimizer, gen_scheduler,
+                 disc_scheduler, gen_criterion, disc_criterion, device, train_loader, val_loader,
+                 options):
         """
         :param generator: Generator model
         :param discriminator: Discriminator model
         :param gen_optimizer: Generator optimizer
         :param disc_optimizer: Discriminator optimizer
+        :param gen_scheduler: Generator lr scheduler
+        :param disc_scheduler: Discriminator lr scheduler
         :param gen_criterion: Generator loss function
         :param disc_criterion: Discriminator loss function
         :param device: Device to use for training
@@ -90,6 +105,8 @@ class Trainer:
         self.discriminator = discriminator
         self.gen_optimizer = gen_optimizer
         self.disc_optimizer = disc_optimizer
+        self.gen_scheduler = gen_scheduler
+        self.disc_scheduler = disc_scheduler
         self.gen_criterion = gen_criterion
         self.disc_criterion = disc_criterion
         self.device = device
@@ -99,7 +116,7 @@ class Trainer:
 
         if options['checkpoint_path'] is not None:
             self.checkpoint = Checkpoint(generator, discriminator, gen_optimizer, disc_optimizer,
-                                         options['checkpoint_path'])
+                                         gen_scheduler, disc_scheduler, options['checkpoint_path'])
             if options['reset_training']:
                 self.checkpoint.delete()
             self.history = self.checkpoint.load()
@@ -174,7 +191,6 @@ class Trainer:
         input_imgs, target_imgs = batch
 
         with torch.no_grad():
-
             # generate fake images
             fake_images = self.generator(input_imgs)
 
@@ -245,6 +261,12 @@ class Trainer:
             val_disc_loss /= len(self.val_loader)
             self.history['val_gen_loss'].append(val_gen_loss)
             self.history['val_disc_loss'].append(val_disc_loss)
+
+            # update lr schedulers
+            if self.disc_scheduler is not None:
+                self.disc_scheduler.step()
+            if self.gen_scheduler is not None:
+                self.gen_scheduler.step()
 
             end_time = time.time()
 
