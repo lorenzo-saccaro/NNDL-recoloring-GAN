@@ -134,15 +134,14 @@ class Trainer:
         train_disc_loss = 0
         train_iter = tqdm(self.train_loader)
 
-        for batch in train_iter:
-            batch = batch.to(self.device)
+        for input_imgs, target_imgs in train_iter:
+            # move images to device
+            input_imgs = input_imgs.to(self.device, non_blocking=True)
+            target_imgs = target_imgs.to(self.device, non_blocking=True)
 
             # set models to train mode
             self.generator.train()
             self.discriminator.train()
-
-            # get images from batch
-            input_imgs, target_imgs = batch
 
             # generate fake images
             fake_images = self.generator(input_imgs)
@@ -159,8 +158,8 @@ class Trainer:
             # get discriminator predictions for real images
             real_preds = self.discriminator(real_images_to_disc)
             # calculate discriminator loss
-            disc_loss = self.disc_criterion(fake_preds, real_preds, target_imgs, fake_images,
-                                            self.discriminator)
+            disc_loss = self.disc_criterion(input_imgs, real_preds, fake_preds, target_imgs,
+                                            fake_images, self.discriminator)
             # backpropagate discriminator loss
             disc_loss.backward()
             # update discriminator weights
@@ -174,7 +173,7 @@ class Trainer:
             # get discriminator predictions for fake images
             fake_preds = self.discriminator(fake_images_to_disc)
             # calculate generator loss
-            gen_loss = self.gen_criterion(fake_preds, target_imgs, fake_images, self.device)
+            gen_loss = self.gen_criterion(fake_preds, target_imgs, fake_images)
             # backpropagate generator loss
             gen_loss.backward()
             # update generator weights
@@ -187,8 +186,8 @@ class Trainer:
 
         train_gen_loss /= len(self.train_loader)
         train_disc_loss /= len(self.train_loader)
-        self.history['train_gen_loss'].append(train_gen_loss)
-        self.history['train_disc_loss'].append(train_disc_loss)
+        self.history['train_gen_loss'].append(train_gen_loss.item())
+        self.history['train_disc_loss'].append(train_disc_loss.item())
 
     def _validate_epoch(self):
         """
@@ -199,16 +198,15 @@ class Trainer:
         val_disc_loss = 0
         val_iter = tqdm(self.val_loader)
 
-        for batch in val_iter:
-            batch = batch.to(self.device)
+        for input_imgs, target_imgs in val_iter:
+            # move images to device
+            input_imgs = input_imgs.to(self.device, non_blocking=True)
+            target_imgs = target_imgs.to(self.device, non_blocking=True)
 
             # TODO: in the paper they use train mode also for validation
             #  (Dropout and BatchNorm in place of noise)
             self.generator.eval()
             self.discriminator.eval()
-
-            # get images from batch
-            input_imgs, target_imgs = batch
 
             with torch.no_grad():
                 # generate fake images
@@ -223,8 +221,8 @@ class Trainer:
                 # get discriminator predictions for real images
                 real_preds = self.discriminator(real_images_to_disc)
                 # calculate discriminator loss
-                disc_loss = self.disc_criterion(fake_preds, real_preds, target_imgs, fake_images,
-                                                self.discriminator)
+                disc_loss = self.disc_criterion(input_imgs, real_preds, fake_preds, target_imgs,
+                                                fake_images, self.discriminator)
                 # calculate generator loss
                 gen_loss = self.gen_criterion(fake_preds, target_imgs, fake_images)
 
@@ -235,8 +233,8 @@ class Trainer:
 
         val_gen_loss /= len(self.val_loader)
         val_disc_loss /= len(self.val_loader)
-        self.history['val_gen_loss'].append(val_gen_loss)
-        self.history['val_disc_loss'].append(val_disc_loss)
+        self.history['val_gen_loss'].append(val_gen_loss.item())
+        self.history['val_disc_loss'].append(val_disc_loss.item())
 
     def train(self):
         """
@@ -253,7 +251,7 @@ class Trainer:
         while current_epoch < self.options['num_epochs']:
             start_time = time.time()
             print("\n\n")
-            print("Epoch {}/{}".format(current_epoch + 1, self.options['epochs']))
+            print("Epoch {}/{}".format(current_epoch + 1, self.options['num_epochs']))
 
             # train
             print("Training...")
@@ -312,15 +310,14 @@ class WTrainer(Trainer):
         train_disc_loss = 0
         train_iter = tqdm(self.train_loader)
 
-        for i, batch in enumerate(train_iter):
-            batch = batch.to(self.device)
+        for i, (input_imgs, target_imgs) in enumerate(train_iter):
+            # move images to device
+            input_imgs = input_imgs.to(self.device, non_blocking=True)
+            target_imgs = target_imgs.to(self.device, non_blocking=True)
 
             # set models to train mode
             self.generator.train()
             self.discriminator.train()
-
-            # get images from batch
-            input_imgs, target_imgs = batch
 
             # generate fake images
             fake_images = self.generator(input_imgs)
@@ -337,8 +334,8 @@ class WTrainer(Trainer):
             # get discriminator predictions for real images
             real_preds = self.discriminator(real_images_to_disc)
             # calculate discriminator loss
-            disc_loss = self.disc_criterion(fake_preds, real_preds, target_imgs, fake_images,
-                                            self.discriminator)
+            disc_loss = self.disc_criterion(input_imgs, real_preds, fake_preds, target_imgs,
+                                            fake_images, self.discriminator)
             # backpropagate discriminator loss
             disc_loss.backward()
             # update discriminator weights
@@ -349,7 +346,7 @@ class WTrainer(Trainer):
 
             train_disc_loss += disc_loss.detach().cpu()
 
-            # train generator
+            # train generator every n_critic iterations
             if (i + 1) % self.options['n_critic'] == 0:
                 self.gen_optimizer.zero_grad()
                 # combine input images and fake images
@@ -359,7 +356,7 @@ class WTrainer(Trainer):
                 # calculate generator loss
                 gen_loss = self.gen_criterion(fake_preds, target_imgs, fake_images)
                 # backpropagate generator loss
-                gen_loss.backward()
+                gen_loss.backward()  # TODO: fix runtime error gradient penalty
                 # update generator weights
                 self.gen_optimizer.step()
 
@@ -369,8 +366,8 @@ class WTrainer(Trainer):
 
         train_gen_loss /= (len(self.train_loader) // self.options['n_critic'])
         train_disc_loss /= len(self.train_loader)
-        self.history['train_gen_loss'].append(train_gen_loss)
-        self.history['train_disc_loss'].append(train_disc_loss)
+        self.history['train_gen_loss'].append(train_gen_loss.item())
+        self.history['train_disc_loss'].append(train_disc_loss.item())
 
 
 class ClipWeights(object):
@@ -379,7 +376,6 @@ class ClipWeights(object):
 
     def __call__(self, module):
         if hasattr(module, 'weight'):
-            print("Entered")
             w = module.weight.data
-            w = w.clamp(-1, 1)
+            w = w.clamp(-0.01, 0.01)
             module.weight.data = w

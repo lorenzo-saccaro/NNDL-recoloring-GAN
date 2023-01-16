@@ -49,10 +49,10 @@ class CocoDataset(Dataset):
 
         # apply transforms
         if self.transform_x is not None:
-            x = self.transform_x(img)
+            x = self.transform_x(x)
 
         if self.transform_y is not None:
-            y = self.transform_y(img)
+            y = self.transform_y(y)
 
         return x, y
 

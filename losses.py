@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 
 def discriminator_loss(real_output, fake_output, device):
@@ -25,17 +26,6 @@ def generator_loss(fake_output, device):
     """
     return torch.nn.functional.binary_cross_entropy_with_logits(
         fake_output, torch.ones_like(fake_output, device=device))
-
-
-def Wasserstein_loss(real_output, fake_output):
-    """
-    Calculates Wasserstein loss, note that we are using +1 as the label for fakes and -1 as the label for reals
-    (pass real_output =0 when computing loss for generator)
-    :param real_output: real image output of discriminator
-    :param fake_output: fake image output of discriminator
-    :return: Wasserstein loss
-    """
-    return torch.mean(fake_output) - torch.mean(real_output)
 
 
 def L1_loss(real_image, fake_image):
@@ -81,10 +71,11 @@ class DiscriminatorCriterion:
         self.gp_type = gp_type
         self.gp_constant = gp_constant
 
-    def __call__(self, real_output, fake_output, real_images=None, fake_images=None,
+    def __call__(self, input_images, real_output, fake_output, real_images=None, fake_images=None,
                  discriminator=None):
         """
         Calculates discriminator loss
+        :param input_images: input images
         :param real_output: real image output of discriminator
         :param fake_output: fake image output of discriminator
         :param real_images: real images
@@ -93,45 +84,68 @@ class DiscriminatorCriterion:
         :return:
         """
         if self.wgan:
-            loss = Wasserstein_loss(real_output, fake_output)
+            loss = +torch.mean(fake_output) - torch.mean(real_output)
             if self.wgan_gp:
-                loss += self._gradient_penalty(real_images, fake_images, discriminator)
+                loss += self._gradient_penalty(input_images, real_images, fake_images, discriminator)
             return loss
         else:
             return discriminator_loss(real_output, fake_output, self.device)
 
-    def _gradient_penalty(self, real_images, fake_images, discriminator):
-        """
-        Calculates gradient penalty
-        :param real_images: real images
-        :param fake_images: fake images
-        :param discriminator: discriminator
-        :return: gradient penalty
-        """
-        if self.gp_type == 'real':
-            interpolates = real_images
-        elif self.gp_type == 'fake':
-            interpolates = fake_images
-        elif self.gp_type == 'mixed':
-            # Random weight term for interpolation between real and fake data
-            alpha = torch.randn((real_images.size(0), 1, 1, 1), device=self.device)
-            # Get random interpolation between real and fake data
-            interpolates = (alpha * real_images + ((1 - alpha) * fake_images)).requires_grad_(True)
-        else:
-            raise ValueError("Invalid gradient penalty type")
 
-        disc_interpolates = discriminator(interpolates)
-        grad_outputs = torch.ones(disc_interpolates.size(), device=self.device, requires_grad=False)
+    # def _gradient_penalty(self, input_images, real_images, fake_images, discriminator):
+    #     """
+    #     Calculates gradient penalty
+    #     :param input_images: input images
+    #     :param real_images: real images
+    #     :param fake_images: fake images
+    #     :param discriminator: discriminator
+    #     :return: gradient penalty
+    #     """
+    #     if self.gp_type == 'real':
+    #         interpolates = real_images
+    #     elif self.gp_type == 'fake':
+    #         interpolates = fake_images
+    #     elif self.gp_type == 'mixed':
+    #         # Random weight term for interpolation between real and fake data
+    #         alpha = torch.randn((real_images.size(0), 1, 1, 1), device=self.device)
+    #         # Get random interpolation between real and fake data
+    #         interpolates = (alpha * real_images + ((1 - alpha) * fake_images)).requires_grad_(True)
+    #     else:
+    #         raise ValueError("Invalid gradient penalty type")
+    #
+    #     disc_interpolates = discriminator(torch.cat([input_images, interpolates], dim=1))
+    #     grad_outputs = torch.ones(disc_interpolates.size(), device=self.device)
+    #
+    #     # Get gradient w.r.t. interpolates
+    #     gradients = torch.autograd.grad(outputs=disc_interpolates, inputs=interpolates,
+    #                                     grad_outputs=grad_outputs, create_graph=True,
+    #                                     retain_graph=True, only_inputs=True)[0]
+    #     gradients = gradients.view(gradients.size(0), -1)
+    #
+    #     gradient_penalty = torch.mean(
+    #         ((gradients + 1e-16).norm(2, dim=1) - self.gp_constant) ** 2)
+    #
+    #     return gradient_penalty * self.gp_lambda
 
+    def _gradient_penalty(self, input_images, real_samples, fake_samples, dis):
+        # Random weight term for interpolation between real and fake samples
+        alpha = torch.Tensor(np.random.random((real_samples.size(0), 1, 1, 1))).to(self.device)
+        # Get random interpolation between real and fake samples
+        interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+        d_interpolates = dis(torch.cat([input_images, interpolates], dim=1))
+        fake = torch.ones(d_interpolates.size(), device=self.device)
+        fake.requires_grad = False
         # Get gradient w.r.t. interpolates
-        gradients = torch.autograd.grad(outputs=disc_interpolates, inputs=interpolates,
-                                        grad_outputs=grad_outputs, create_graph=True,
-                                        retain_graph=True, only_inputs=True)[0]
-        gradients = gradients.view(gradients.size(0), -1)
-
-        gradient_penalty = torch.mean(
-            ((gradients + 1e-16).norm(2, dim=1) - self.gp_constant) ** 2)
-
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates,
+            inputs=interpolates,
+            grad_outputs=fake,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )
+        gradients = gradients[0].view(gradients[0].size(0), -1)
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
         return gradient_penalty * self.gp_lambda
 
 
@@ -163,7 +177,7 @@ class GeneratorCriterion:
         :return: generator loss
         """
         if self.wgan:
-            loss = Wasserstein_loss(real_output=0, fake_output=fake_output)
+            loss = -torch.mean(fake_output)
         else:
             loss = generator_loss(fake_output, self.device)
         if self.use_l1_loss:
