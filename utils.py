@@ -1,7 +1,7 @@
 import datetime
-from torchvision.utils import make_grid
-import matplotlib.pyplot as plt
-import numpy as np
+import os
+from PIL import Image
+from concurrent.futures import ThreadPoolExecutor
 
 
 def format_time(elapsed):
@@ -16,27 +16,49 @@ def format_time(elapsed):
     return str(datetime.timedelta(seconds=elapsed_rounded))
 
 
-def generate_and_save_images(generator, epoch, gen_input):
+def remove_grayscale_images(dataset_folder, dataset_type):
     """
-    Generates and saves rgb images
-    :param generator: generator model
-    :param epoch: current epoch
-    :param gen_input: noise input for generator
-    :return:
+    :param dataset_folder: path to the dataset folder
+    :param dataset_type: train, val or test split
     """
-    current_mode = generator.training
+    # parameters value check dataset_type: map train, val, test to train2017, val2017, test2017
+    if dataset_type == 'train':
+        dataset_type = 'train2017'
+    elif dataset_type == 'val':
+        dataset_type = 'val2017'
+    elif dataset_type == 'test':
+        dataset_type = 'test2017'
+    else:
+        raise Exception(
+            'Invalid dataset type: ' + dataset_type + '. Must be train, val, or test.')
 
-    generator.eval()
-    predictions = generator(gen_input)
-    # TODO: check if values need to be scaled
-    grid = make_grid(predictions, 4).numpy().squeeze().transpose(1, 2, 0)
+    path = os.path.join(dataset_folder, dataset_type)
 
-    plt.imshow(grid.astype(np.uint8))
-    plt.axis('off')
+    # Initialize a counter for the number of grayscale images
+    gray_count = 0
 
-    plt.savefig('image_at_epoch_{:04d}.png'.format(epoch))
-    plt.show()
+    def remove_gray_image(image_path):
+        # load image
+        img = Image.open(image_path)
+        # check if img is grayscale remove it and update counter
+        if img.mode == 'L':
+            img.close()
+            os.remove(image_path)
+            return 1
+        return 0
 
-    # reset generator to previous mode
-    generator.train() if current_mode else generator.eval()
+    # Iterate through the path directory and remove the grayscale images
+    executor = ThreadPoolExecutor()
+    for file in os.listdir(path):
+        if file.endswith('.jpg'):
+            future = executor.submit(remove_gray_image, os.path.join(path, file))
+            gray_count += future.result()
 
+    executor.shutdown(wait=True)
+    print('Removed ' + str(gray_count) + ' grayscale images from ' + path)
+
+
+if __name__ == '__main__':
+    dataset_folder = 'C:\\Users\\loren\\Datasets\\coco2017'
+    dataset_type = 'train'
+    remove_grayscale_images(dataset_folder, dataset_type)
