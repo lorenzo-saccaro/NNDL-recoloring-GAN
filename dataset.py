@@ -1,21 +1,24 @@
 # create Dataset class to load coco dataset
 import os.path
 from torch.utils.data import Dataset
-from PIL import Image
+from PIL import Image, ImageStat
 from skimage.color import rgb2lab
 from torchvision.transforms import ToTensor, Compose
+import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class CocoDataset(Dataset):
 
     def __init__(self, dataset_folder, dataset_type, transforms=None, use_lab_colorspace=False,
-                 frac=1.0):
+                 frac=1.0, remove_gray=False):
         """
         :param dataset_folder: path to the dataset folder
         :param dataset_type: train, val or test split
         :param transforms: transforms to apply to the input image
         :param use_lab_colorspace: whether to use LAB colorspace
         :param frac: fraction of the dataset to use
+        :param remove_gray: whether to remove grayscale images from the dataset
         """
         # parameters value check dataset_type: map train, val, test to train2017, val2017, test2017
         if dataset_type == 'train':
@@ -32,6 +35,7 @@ class CocoDataset(Dataset):
         self.transforms = transforms
         self.use_lab_colorspace = use_lab_colorspace
         self.frac = frac
+        self.remove_gray = remove_gray
         self.to_tensor = ToTensor()
 
         # remove ToTensor() from the transform list if present
@@ -45,6 +49,31 @@ class CocoDataset(Dataset):
         for file in os.listdir(self.path):
             if file.endswith('.jpg'):
                 self.images.append(os.path.join(self.path, file))
+
+        # if training set, remove grayscale images
+        if dataset_type == 'train2017' and self.remove_gray:
+            non_gray = []
+            with ThreadPoolExecutor() as executor:
+                futures = {executor.submit(self._exclude_gray, file) for file in self.images}
+                for future in tqdm.tqdm(as_completed(futures), total=len(futures)):
+                    result = future.result()
+                    if result is not None:
+                        non_gray.append(result)
+            gray_images = len(self.images) - len(non_gray)
+            self.images = non_gray
+            print('Excluded ' + str(gray_images) + ' grayscale images from training set.')
+
+    def _exclude_gray(self, file):
+        img_path = os.path.join(self.path, file)
+        img = Image.open(img_path).convert('RGB')
+        stat = ImageStat.Stat(img)
+        img.close()
+        if sum(stat.sum) / 3 == stat.sum[0]:
+            return None
+        else:
+            return img_path
+
+
 
     def __len__(self):
         return int(len(self.images) * self.frac)
