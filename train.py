@@ -1,12 +1,15 @@
 import os
 import time
+
+import numpy as np
+
 from utils import format_time
 from tqdm import tqdm
 import torch
 import matplotlib.pyplot as plt
 from IPython.display import clear_output
 from skimage.color import lab2rgb
-
+import torchmetrics
 
 class Checkpoint:
 
@@ -88,7 +91,7 @@ class Checkpoint:
 class Trainer:
     def __init__(self, generator, discriminator, gen_optimizer, disc_optimizer, gen_scheduler,
                  disc_scheduler, gen_criterion, disc_criterion, device, train_loader, val_loader,
-                 options):
+                 metrics, options):
         """
         :param generator: Generator model
         :param discriminator: Discriminator model
@@ -101,6 +104,7 @@ class Trainer:
         :param device: Device to use for training
         :param train_loader: Training data loader
         :param val_loader: Validation data loader
+        :param metrics: list of instances of metrics objects from torchmetrics
         :param options: Training options, a dictionary
         """
 
@@ -115,6 +119,7 @@ class Trainer:
         self.device = device
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.metrics = metrics
         self.options = options
 
         if self.options['clip_weights']:
@@ -132,6 +137,61 @@ class Trainer:
         else:
             self.checkpoint = None
             self.history = None
+
+    def _update_metrics(self, inputs, targets, outputs):
+        """
+        Updates the metrics for the current batch.
+        :param inputs: input images
+        :param targets: target images
+        :param outputs: generated images
+        :return: uiqi value (needs to be treated separately for memory issues)
+        """
+        if self.options['use_lab_colorspace']:
+            # map values in [0, 1] and combine channels, inputs, targets and outputs are in range [-1, 1]
+            L = inputs
+            L = (L + 1) * 0.5
+            ab_true = targets * 0.5 + 0.5
+            ab_pred = outputs * 0.5 + 0.5
+            true_imgs = torch.cat((L, ab_true), dim=1)
+            fake_imgs = torch.cat((L, ab_pred), dim=1)
+        else:
+            true_imgs = targets  # already in range [0, 1]
+            fake_imgs = outputs
+            # remap the generated image to the range [0, 1] (tanh activation in last layer)
+            fake_imgs = fake_imgs * 0.5 + 0.5
+
+        # compute the metrics
+        uiqi = 0
+        for metric in self.metrics:
+            if metric._get_name() == 'FrechetInceptionDistance':
+                metric.update(true_imgs, real=True)
+                metric.update(fake_imgs, real=False)
+            elif metric._get_name() == 'UniversalImageQualityIndex':
+                # need to use functional interface
+                uiqi = torchmetrics.functional.universal_image_quality_index(fake_imgs, true_imgs,
+                                                                             data_range=1.0,
+                                                                             reduction=None)
+                uiqi = uiqi.mean(axis=(1, 2, 3))
+                uiqi = uiqi[~torch.isnan(uiqi)].mean()
+            else:
+                metric.update(fake_imgs, true_imgs)
+
+        return uiqi
+
+    def _compute_metrics(self, split):
+        """
+        Computes the metrics for the current epoch.
+        :param split: 'train' or 'val'
+        :return:
+        """
+        for metric in self.metrics:
+            if metric._get_name() == 'UniversalImageQualityIndex':
+                continue
+            name = metric._get_name().lower()
+            key = '{}_{}'.format(split, name)
+            val = metric.compute()
+            self.history.setdefault(key, []).append(val.item())
+            metric.reset()
 
     def _plot_images(self, inputs, targets, outputs, split, epoch, step):
         """
@@ -173,20 +233,21 @@ class Trainer:
             fake_imgs = fake_imgs * 0.5 + 0.5
 
         # Plot the first 8 input images, target images and generated images
-        fig = plt.figure(figsize=(2*n_plot, 9))
+        fig = plt.figure(figsize=(2 * n_plot, 9))
         for i in range(n_plot):
             ax = fig.add_subplot(3, n_plot, i + 1, xticks=[], yticks=[])
             ax.imshow(input_imgs[i], cmap='gray')
             ax = fig.add_subplot(3, n_plot, i + n_plot + 1, xticks=[], yticks=[])
             ax.imshow(fake_imgs[i])
-            ax = fig.add_subplot(3, n_plot, i + 2*n_plot + 1, xticks=[], yticks=[])
+            ax = fig.add_subplot(3, n_plot, i + 2 * n_plot + 1, xticks=[], yticks=[])
             ax.imshow(true_imgs[i])
         # set title
         fig.suptitle(title, fontsize=20)
         fig.tight_layout()
         # save figure
         fig.savefig(
-            os.path.join(self.options['output_path'], '{}_epoch_{}_{}.png'.format(split, epoch, step)))
+            os.path.join(self.options['output_path'],
+                         '{}_epoch_{}_{}.png'.format(split, epoch, step)))
         plt.show()
 
     @staticmethod
@@ -210,6 +271,7 @@ class Trainer:
         """
         train_gen_loss = 0
         train_disc_loss = 0
+        uiqi = []  # universal image quality index
         train_iter = tqdm(self.train_loader)
 
         # set models to train mode
@@ -266,6 +328,9 @@ class Trainer:
                 # update generator weights
                 self.gen_optimizer.step()
 
+                # update metric on batch (treat uiqi separately)
+                uiqi_ = self._update_metrics(input_imgs.detach(), target_imgs.detach(), fake_images.detach())
+                uiqi.append(uiqi_.detach().cpu().item())
                 train_iter.set_description(
                     "Gen loss: {:.4f}, Disc loss: {:.4f}".format(gen_loss, disc_loss))
                 train_gen_loss += gen_loss.detach().cpu()
@@ -276,12 +341,16 @@ class Trainer:
                 if i == len(self.train_loader) - 1:
                     step = 'end'
                 self._plot_images(input_imgs, target_imgs, fake_images,
-                                  split='train', epoch=self.history['elapsed_epochs']+1, step=step)
+                                  split='train', epoch=self.history['elapsed_epochs'] + 1,
+                                  step=step)
 
         train_gen_loss /= (len(self.train_loader) // self.options['n_critic'])
         train_disc_loss /= len(self.train_loader)
+        uiqi = np.array(uiqi)
+        uiqi = uiqi[np.isfinite(uiqi)].mean()
         self.history['train_gen_loss'].append(train_gen_loss.item())
         self.history['train_disc_loss'].append(train_disc_loss.item())
+        self.history.setdefault('train_universalimagequalityindex', []).append(uiqi.item())
 
     def _validate_epoch(self):
         """
@@ -290,6 +359,7 @@ class Trainer:
         """
         val_gen_loss = 0
         val_disc_loss = 0
+        uiqi = []  # universal image quality index
         val_iter = tqdm(self.val_loader)
 
         # TODO: in the paper they use train mode also for validation
@@ -321,6 +391,9 @@ class Trainer:
             # calculate generator loss
             gen_loss = self.gen_criterion(fake_preds, target_imgs, fake_images)
 
+            # update metric on batch (treat uiqi separately)
+            uiqi_ = self._update_metrics(input_imgs.detach(), target_imgs.detach(), fake_images.detach())
+            uiqi.append(uiqi_.detach().cpu().item())
             val_iter.set_description(
                 "Gen loss: {:.4f}, Disc loss: {:.4f}".format(gen_loss, disc_loss))
             val_gen_loss += gen_loss.detach().cpu()
@@ -332,8 +405,11 @@ class Trainer:
 
         val_gen_loss /= len(self.val_loader)
         val_disc_loss /= len(self.val_loader)
+        uiqi = np.array(uiqi)
+        uiqi = uiqi[np.isfinite(uiqi)].mean()
         self.history['val_gen_loss'].append(val_gen_loss.item())
         self.history['val_disc_loss'].append(val_disc_loss.item())
+        self.history.setdefault('val_universalimagequalityindex', []).append(uiqi.item())
 
     def train(self):
         """
@@ -355,10 +431,14 @@ class Trainer:
             # train
             print("Training...")
             self._train_epoch()
+            # compute epoch metrics
+            self._compute_metrics('train')
 
             # validate
             print("Validation...")
             self._validate_epoch()
+            # compute epoch metrics
+            self._compute_metrics('val')
 
             # update lr schedulers
             if self.disc_scheduler is not None:
@@ -370,11 +450,16 @@ class Trainer:
             self.history['epoch_times'].append(end_time - start_time)
 
             # print epoch summary
-            print("Epoch {} took {}".format(current_epoch + 1, format_time(self.history['epoch_times'][-1])))
+            print("Epoch {} took {}".format(current_epoch + 1,
+                                            format_time(self.history['epoch_times'][-1])))
             print("Train Generator Loss: {:.4f}".format(self.history['train_gen_loss'][-1]))
             print("Train Discriminator Loss: {:.4f}".format(self.history['train_disc_loss'][-1]))
             print("Validation Generator Loss: {:.4f}".format(self.history['val_gen_loss'][-1]))
             print("Validation Discriminator Loss: {:.4f}".format(self.history['val_disc_loss'][-1]))
+            for metric in self.metrics:
+                name = metric._get_name()
+                print("Train {}: {:.4f}".format(name, self.history['train_' + name.lower()][-1]))
+                print("Validation {}: {:.4f}".format(name, self.history['val_' + name.lower()][-1]))
 
             # clear output every 10 epochs
             if (current_epoch + 1) % 10 == 0:

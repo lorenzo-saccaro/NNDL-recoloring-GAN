@@ -1,6 +1,6 @@
 import datetime
 import os
-from PIL import Image
+from PIL import Image, ImageStat
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -39,9 +39,10 @@ def remove_grayscale_images(dataset_folder, dataset_type):
 
     def remove_gray_image(image_path):
         # load image
-        img = Image.open(image_path)
+        img = Image.open(image_path).convert('RGB')
         # check if img is grayscale remove it and update counter
-        if img.mode == 'L':
+        stat = ImageStat.Stat(img)
+        if sum(stat.sum) / 3 == stat.sum[0]:
             img.close()
             os.remove(image_path)
             return 1
