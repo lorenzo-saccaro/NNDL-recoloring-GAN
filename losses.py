@@ -81,16 +81,17 @@ class DiscriminatorCriterion:
         :param real_images: real images
         :param fake_images: fake images
         :param discriminator: discriminator instance
-        :return:
+        :return: disc gan loss, gradient penalty (none if not used)
         """
+        grad_pen = None
         if self.wgan:
-            loss = +torch.mean(fake_output) - torch.mean(real_output)
+            loss = torch.mean(fake_output) - torch.mean(real_output)
             if self.wgan_gp:
-                loss += self._gradient_penalty(input_images, real_images, fake_images,
+                grad_pen = self._gradient_penalty(input_images, real_images, fake_images,
                                                discriminator)
-            return loss
+            return loss, grad_pen
         else:
-            return discriminator_loss(real_output, fake_output, self.device)
+            return discriminator_loss(real_output, fake_output, self.device), grad_pen
 
     def _gradient_penalty(self, input_images, real_images, fake_images, discriminator):
         """
@@ -157,11 +158,11 @@ class GeneratorCriterion:
         :return: generator loss
         """
         if self.wgan:
-            loss = -torch.mean(fake_output)
+            gan_loss = -torch.mean(fake_output)
         else:
-            loss = generator_loss(fake_output, self.device)
+            gan_loss = generator_loss(fake_output, self.device)
         if self.use_l1_loss:
-            loss += self.l1_lambda * L1_loss(real_image, fake_image)
+            recon_loss = self.l1_lambda * L1_loss(real_image, fake_image)
         if self.use_l2_loss:
-            loss += self.l2_lambda * L2_loss(real_image, fake_image)
-        return loss
+            recon_loss = self.l2_lambda * L2_loss(real_image, fake_image)
+        return gan_loss, recon_loss

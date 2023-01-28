@@ -11,6 +11,7 @@ from IPython.display import clear_output
 from skimage.color import lab2rgb
 import torchmetrics
 
+
 class Checkpoint:
 
     def __init__(self, generator, discriminator, gen_optimizer, disc_optimizer, gen_scheduler,
@@ -155,9 +156,10 @@ class Trainer:
             true_imgs = torch.cat((L, ab_true), dim=1)
             fake_imgs = torch.cat((L, ab_pred), dim=1)
         else:
-            true_imgs = targets  # already in range [0, 1]
+            # map to [0, 1] range
+            true_imgs = targets
+            true_imgs = true_imgs * 0.5 + 0.5
             fake_imgs = outputs
-            # remap the generated image to the range [0, 1] (tanh activation in last layer)
             fake_imgs = fake_imgs * 0.5 + 0.5
 
         # compute the metrics
@@ -230,6 +232,8 @@ class Trainer:
             true_imgs = targets.cpu().permute(0, 2, 3, 1).detach().numpy()
             fake_imgs = outputs.cpu().permute(0, 2, 3, 1).detach().numpy()
             # remap the generated image to the range [0, 1] (tanh activation in last layer)
+            input_imgs = input_imgs * 0.5 + 0.5
+            true_imgs = true_imgs * 0.5 + 0.5
             fake_imgs = fake_imgs * 0.5 + 0.5
 
         # Plot the first 8 input images, target images and generated images
@@ -270,7 +274,10 @@ class Trainer:
         :return:
         """
         train_gen_loss = 0
+        train_gen_loss_gan = 0
+        train_gen_loss_recon = 0
         train_disc_loss = 0
+        gp_loss = 0
         uiqi = []  # universal image quality index
         train_iter = tqdm(self.train_loader)
 
@@ -283,8 +290,9 @@ class Trainer:
             input_imgs = input_imgs.to(self.device, non_blocking=True)
             target_imgs = target_imgs.to(self.device, non_blocking=True)
 
-            # generate fake images
-            fake_images = self.generator(input_imgs)
+            # generate fake images (no gradient, do not backpropagate in generator)
+            with torch.no_grad():
+                fake_images = self.generator(input_imgs)
 
             # train discriminator
             self._set_requires_grad(self.discriminator, True)
@@ -292,16 +300,21 @@ class Trainer:
             # combine input images and fake images
             fake_images_to_disc = torch.cat([input_imgs, fake_images], dim=1)
             # get discriminator predictions for fake images
-            fake_preds = self.discriminator(fake_images_to_disc.detach())
+            fake_preds = self.discriminator(fake_images_to_disc)
             # combine input images and real images
             real_images_to_disc = torch.cat([input_imgs, target_imgs], dim=1)
             # get discriminator predictions for real images
             real_preds = self.discriminator(real_images_to_disc)
             # calculate discriminator loss
-            disc_loss = self.disc_criterion(input_imgs, real_preds, fake_preds, target_imgs,
-                                            fake_images, self.discriminator)
+            disc_loss, gp = self.disc_criterion(input_imgs, real_preds, fake_preds, target_imgs,
+                                                fake_images, self.discriminator)
             # backpropagate discriminator loss
             disc_loss.backward()
+            # backpropagate gradient penalty
+            if gp is not None:
+                gp.backward(retain_graph=True)
+                disc_loss += gp
+                gp_loss += gp.detach().cpu()
             # update discriminator weights
             self.disc_optimizer.step()
             # clip discriminator weights
@@ -321,20 +334,30 @@ class Trainer:
                 fake_images_to_disc = torch.cat([input_imgs, fake_images], dim=1)
                 # get discriminator predictions for fake images
                 fake_preds = self.discriminator(fake_images_to_disc)
-                # calculate generator loss
-                gen_loss = self.gen_criterion(fake_preds, target_imgs, fake_images)
+                # calculate generator loss, gan loss + reconstruction loss (L1 or L2)
+                gen_loss_gan, gen_loss_recon = self.gen_criterion(fake_preds, target_imgs,
+                                                                  fake_images)
+                gen_loss = gen_loss_gan + gen_loss_recon
                 # backpropagate generator loss
                 gen_loss.backward()
                 # update generator weights
                 self.gen_optimizer.step()
 
                 # update metric on batch (treat uiqi separately)
-                uiqi_ = self._update_metrics(input_imgs.detach(), target_imgs.detach(), fake_images.detach())
+                uiqi_ = self._update_metrics(input_imgs.detach(), target_imgs.detach(),
+                                             fake_images.detach())
                 uiqi.append(uiqi_.detach().cpu().item())
-                train_iter.set_description(
-                    "Gen loss: {:.4f}, Disc loss: {:.4f}".format(gen_loss, disc_loss))
+
+                if gp is not None:
+                    display_string = "Gen loss: {:.4f}, Gen gan loss {:.4f}, Gen recon loss {:.4f}, Disc loss: {:.4f}, Disc gan loss {:.4f}, GP :{:.4f}".format(
+                        gen_loss, gen_loss_gan, gen_loss_recon, disc_loss, disc_loss - gp, gp)
+                else:
+                    display_string = "Gen loss: {:.4f}, Gen gan loss {:.4f}, Gen recon loss {:.4f}, Disc loss: {:.4f}".format(
+                        gen_loss, gen_loss_gan, gen_loss_recon, disc_loss)
+                train_iter.set_description(display_string)
                 train_gen_loss += gen_loss.detach().cpu()
-                train_disc_loss += disc_loss.detach().cpu()
+                train_gen_loss_gan += gen_loss_gan.detach().cpu()
+                train_gen_loss_recon += gen_loss_recon.detach().cpu()
 
             if (i + 1) % self.options['plot_every_nstep'] == 0 or i == len(self.train_loader) - 1:
                 step = i + 1
@@ -345,11 +368,18 @@ class Trainer:
                                   step=step)
 
         train_gen_loss /= (len(self.train_loader) // self.options['n_critic'])
+        train_gen_loss_gan /= (len(self.train_loader) // self.options['n_critic'])
+        train_gen_loss_recon /= (len(self.train_loader) // self.options['n_critic'])
         train_disc_loss /= len(self.train_loader)
+        gp_loss /= len(self.train_loader)
         uiqi = np.array(uiqi)
         uiqi = uiqi[np.isfinite(uiqi)].mean()
         self.history['train_gen_loss'].append(train_gen_loss.item())
+        self.history['train_gen_loss_gan'].append(train_gen_loss_gan.item())
+        self.history['train_gen_loss_recon'].append(train_gen_loss_recon.item())
         self.history['train_disc_loss'].append(train_disc_loss.item())
+        if isinstance(gp_loss, torch.Tensor):
+            self.history.setdefault('train_gp_loss', []).append(gp_loss.item())
         self.history.setdefault('train_universalimagequalityindex', []).append(uiqi.item())
 
     def _validate_epoch(self):
@@ -358,7 +388,10 @@ class Trainer:
         :return:
         """
         val_gen_loss = 0
+        val_gen_loss_gan = 0
+        val_gen_loss_recon = 0
         val_disc_loss = 0
+        gp_loss = 0
         uiqi = []  # universal image quality index
         val_iter = tqdm(self.val_loader)
 
@@ -386,29 +419,52 @@ class Trainer:
                 real_preds = self.discriminator(real_images_to_disc)
 
             # calculate discriminator loss
-            disc_loss = self.disc_criterion(input_imgs, real_preds, fake_preds, target_imgs,
-                                            fake_images, self.discriminator)
-            # calculate generator loss
-            gen_loss = self.gen_criterion(fake_preds, target_imgs, fake_images)
+            disc_loss, gp = self.disc_criterion(input_imgs, real_preds, fake_preds, target_imgs,
+                                                fake_images, self.discriminator)
+            if gp is not None:
+                disc_loss += gp
+                gp_loss += gp.detach().cpu()
+
+            val_disc_loss += disc_loss.detach().cpu()
+
+            # calculate generator loss, gan loss + reconstruction loss (L1 or L2)
+            gen_loss_gan, gen_loss_recon = self.gen_criterion(fake_preds, target_imgs, fake_images)
+            gen_loss = gen_loss_gan + gen_loss_recon
 
             # update metric on batch (treat uiqi separately)
-            uiqi_ = self._update_metrics(input_imgs.detach(), target_imgs.detach(), fake_images.detach())
+            uiqi_ = self._update_metrics(input_imgs.detach(), target_imgs.detach(),
+                                         fake_images.detach())
             uiqi.append(uiqi_.detach().cpu().item())
-            val_iter.set_description(
-                "Gen loss: {:.4f}, Disc loss: {:.4f}".format(gen_loss, disc_loss))
+
+            if gp is not None:
+                display_string = "Gen loss: {:.4f}, Gen gan loss {:.4f}, Gen recon loss {:.4f}, Disc loss: {:.4f}, Disc gan loss {:.4f}, GP :{:.4f}".format(
+                    gen_loss, gen_loss_gan, gen_loss_recon, disc_loss, disc_loss - gp, gp)
+            else:
+                display_string = "Gen loss: {:.4f}, Gen gan loss {:.4f}, Gen recon loss {:.4f}, Disc loss: {:.4f}".format(
+                    gen_loss, gen_loss_gan, gen_loss_recon, disc_loss)
+
+            val_iter.set_description(display_string)
             val_gen_loss += gen_loss.detach().cpu()
-            val_disc_loss += disc_loss.detach().cpu()
+            val_gen_loss_gan += gen_loss_gan.detach().cpu()
+            val_gen_loss_recon += gen_loss_recon.detach().cpu()
 
             if i == len(self.val_loader) - 1:
                 self._plot_images(input_imgs, target_imgs, fake_images,
                                   split='val', epoch=self.history['elapsed_epochs'] + 1, step='end')
 
         val_gen_loss /= len(self.val_loader)
+        val_gen_loss_gan /= len(self.val_loader)
+        val_gen_loss_recon /= len(self.val_loader)
         val_disc_loss /= len(self.val_loader)
+        gp_loss /= len(self.val_loader)
         uiqi = np.array(uiqi)
         uiqi = uiqi[np.isfinite(uiqi)].mean()
         self.history['val_gen_loss'].append(val_gen_loss.item())
+        self.history['val_gen_loss_gan'].append(val_gen_loss_gan.item())
+        self.history['val_gen_loss_recon'].append(val_gen_loss_recon.item())
         self.history['val_disc_loss'].append(val_disc_loss.item())
+        if isinstance(gp_loss, torch.Tensor):
+            self.history.setdefault('val_gp_loss', []).append(gp_loss.item())
         self.history.setdefault('val_universalimagequalityindex', []).append(uiqi.item())
 
     def train(self):
@@ -418,8 +474,10 @@ class Trainer:
         """
         # TODO: add other metrics
         if self.history is None:
-            self.history = {'train_gen_loss': [], 'train_disc_loss': [],
-                            'val_gen_loss': [], 'val_disc_loss': [],
+            self.history = {'train_gen_loss': [], 'train_gen_loss_gan': [],
+                            'train_gen_loss_recon': [], 'train_disc_loss': [],
+                            'val_gen_loss': [], 'val_gen_loss_gan': [],
+                            'val_gen_loss_recon': [], 'val_disc_loss': [],
                             'elapsed_epochs': 0, 'epoch_times': []}
 
         current_epoch = self.history['elapsed_epochs']
@@ -450,16 +508,38 @@ class Trainer:
             self.history['epoch_times'].append(end_time - start_time)
 
             # print epoch summary
-            print("Epoch {} took {}".format(current_epoch + 1,
-                                            format_time(self.history['epoch_times'][-1])))
-            print("Train Generator Loss: {:.4f}".format(self.history['train_gen_loss'][-1]))
-            print("Train Discriminator Loss: {:.4f}".format(self.history['train_disc_loss'][-1]))
-            print("Validation Generator Loss: {:.4f}".format(self.history['val_gen_loss'][-1]))
-            print("Validation Discriminator Loss: {:.4f}".format(self.history['val_disc_loss'][-1]))
+            print("Epoch {} took {}".format(
+                current_epoch + 1, format_time(self.history['epoch_times'][-1])))
+            print("Train Generator Loss: {:.4f}".format(
+                self.history['train_gen_loss'][-1]))
+            print("Train Generator Loss GAN: {:.4f}".format(
+                self.history['train_gen_loss_gan'][-1]))
+            print("Train Generator Loss Recon: {:.4f}".format(
+                self.history['train_gen_loss_recon'][-1]))
+            print("Train Discriminator Loss: {:.4f}".format(
+                self.history['train_disc_loss'][-1]))
+            if 'train_gp_loss' in self.history:
+                print("Train Gradient Penalty Loss: {:.4f}".format(
+                    self.history['train_gp_loss'][-1]))
+            print('\n')
+            print("Validation Generator Loss: {:.4f}".format(
+                self.history['val_gen_loss'][-1]))
+            print("Validation Generator Loss GAN: {:.4f}".format(
+                self.history['val_gen_loss_gan'][-1]))
+            print("Validation Generator Loss Recon: {:.4f}".format(
+                self.history['val_gen_loss_recon'][-1]))
+            print("Validation Discriminator Loss: {:.4f}".format(
+                self.history['val_disc_loss'][-1]))
+            if 'val_gp_loss' in self.history:
+                print("Validation Gradient Penalty Loss: {:.4f}".format(
+                    self.history['val_gp_loss'][-1]))
+            print('\n')
             for metric in self.metrics:
                 name = metric._get_name()
-                print("Train {}: {:.4f}".format(name, self.history['train_' + name.lower()][-1]))
-                print("Validation {}: {:.4f}".format(name, self.history['val_' + name.lower()][-1]))
+                print("Train {}: {:.4f}".format(
+                    name, self.history['train_' + name.lower()][-1]))
+                print("Validation {}: {:.4f}".format(
+                    name, self.history['val_' + name.lower()][-1]))
 
             # clear output every 10 epochs
             if (current_epoch + 1) % 10 == 0:

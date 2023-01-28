@@ -103,6 +103,9 @@ class CocoDataset(Dataset):
             # convert to tensors in range [0, 1]
             gray = self.to_tensor(gray)
             color = self.to_tensor(color)
+            # scale to [-1, 1]
+            gray = (gray - 0.5) / 0.5
+            color = (color - 0.5) / 0.5
             return gray, color
 
 

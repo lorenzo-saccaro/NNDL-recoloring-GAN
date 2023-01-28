@@ -49,10 +49,65 @@ class EncoderBlock(nn.Module):
         return y
 
 
+class PixelTCL(nn.Module):
+    def __init__(self, in_size, out_size):
+        """
+        Pixel Transposed Convolution Layer as described by Gao, Yuan, Wang, Ji
+        :param in_size: number of input channels
+        """
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_size, out_size, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(in_size, out_size, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(out_size, out_size, kernel_size=3, padding=1)
+
+        self.mask3 = torch.tensor([[[[0, 1, 0],
+                                     [1, 0, 1],
+                                     [0, 1, 0]]]])
+        if torch.cuda.is_available(): self.mask3 = self.mask3.to('cuda')
+        # self.mask3 = self.mask3.repeat_interleave(3, dim=2)
+
+        # initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Conv2d):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def _inflate(self, x, mask_type):
+        """
+        Add blank rows and columns to create the correct tensor's shape for the convolution
+        """
+        inflated = x.repeat_interleave(2, dim=2)
+        inflated = inflated.repeat_interleave(2, dim=3)
+
+        if mask_type == 'a':
+            inflated[:, :, 1::2, :] = 0
+            inflated[:, :, :, 1::2] = 0
+        elif mask_type == 'b':
+            inflated[:, :, ::2, :] = 0
+            inflated[:, :, :, ::2] = 0
+        else:
+            raise 'Wrong mask type, should be \'a\' or \'b\''
+
+        return inflated
+
+    def forward(self, x):
+        a = self.conv1(x)
+        b = self.conv2(x)
+        a_inflated = self._inflate(a, mask_type='a')
+        b_inflated = self._inflate(b, mask_type='b')
+        c = a_inflated + b_inflated
+        self.conv3.weight.data *= self.mask3
+        d = self.conv3(c)
+
+        return c + d
+
 class DecoderBlock(nn.Module):
 
     def __init__(self, in_size, out_size, kernel_size=4, padding=1, stride=2, batch_norm=True,
-                 apply_dropout=True, dropout_p=0.5, use_instance_norm=False):
+                 apply_dropout=True, dropout_p=0.5, use_instance_norm=False, use_pixelTCL=False):
         """
         Convolutional block
         :param in_size: input depth
@@ -64,22 +119,35 @@ class DecoderBlock(nn.Module):
         :param apply_dropout: whether to apply dropout
         :param dropout_p: dropout probability
         :param use_instance_norm: use instance normalization if batch size is 1
+        :param use_pixelTCL: wheter to use PixelTCL instead of ConvTranspose2d (for pixelCNN)
         """
 
         super().__init__()
 
-        self.transpose_conv_block = nn.Sequential(
-            nn.ConvTranspose2d(in_size, out_size, kernel_size=kernel_size, padding=padding,
-                               stride=stride, bias=False),
-            nn.BatchNorm2d(out_size) if (batch_norm and not use_instance_norm) else None,
-            nn.InstanceNorm2d(out_size, affine=True) if (
-                    batch_norm and use_instance_norm) else None,
-            nn.Dropout2d(p=dropout_p) if apply_dropout else None,
-            nn.ReLU(inplace=True))
+        if not use_pixelTCL:
+            self.decoder_block = nn.Sequential(
+                nn.ConvTranspose2d(in_size, out_size, kernel_size=kernel_size, padding=padding,
+                                   stride=stride, bias=False),
+                nn.BatchNorm2d(out_size) if (batch_norm and not use_instance_norm) else None,
+                nn.InstanceNorm2d(out_size, affine=True) if (
+                        batch_norm and use_instance_norm) else None,
+                nn.Dropout2d(p=dropout_p) if apply_dropout else None,
+                nn.ReLU(inplace=True))
 
-        # remove None from conv_block
-        self.transpose_conv_block = nn.Sequential(
-            *[x for x in self.transpose_conv_block if x is not None])
+            # remove None from decoder_block
+            self.decoder_block = nn.Sequential(
+                *[x for x in self.decoder_block if x is not None])
+        else:
+            self.decoder_block = nn.Sequential(
+                PixelTCL(in_size, out_size),
+                nn.BatchNorm2d(out_size) if (batch_norm and not use_instance_norm) else None,
+                nn.InstanceNorm2d(out_size, affine=True) if (
+                            batch_norm and use_instance_norm) else None,
+                nn.Dropout2d(p=dropout_p) if apply_dropout else None,
+                nn.ReLU(inplace=True))
+            # remove None from decoder_block
+            self.decoder_block = nn.Sequential(
+                *[x for x in self.decoder_block if x is not None])
 
         # initialize weights
         self.apply(self._init_weights)
@@ -94,7 +162,7 @@ class DecoderBlock(nn.Module):
             nn.init.constant_(module.bias.data, 0)
 
     def forward(self, x):
-        y = self.transpose_conv_block(x)
+        y = self.decoder_block(x)
 
         return y
 
@@ -103,7 +171,7 @@ class Generator(nn.Module):
 
     def __init__(self, in_channels=1, out_channels=3, filters=(
             64, 128, 256, 512, 512, 512, 512, 512), use_instance_norm=False,
-                 leaky_relu_slope=0.2):
+                 leaky_relu_slope=0.2, use_pixelTCL=False):
         """
         Generator network
         :param in_channels: input channels, 1 for grayscale
@@ -111,6 +179,7 @@ class Generator(nn.Module):
         :param filters: number of filters in each layer
         :param use_instance_norm: use instance normalization if batch size is 1
         :param leaky_relu_slope: slope of leaky ReLU
+        :param use_pixelTCL: wheter to use PixelTCL in decoder instead (for pixelCNN)
         """
         super().__init__()
 
@@ -145,14 +214,17 @@ class Generator(nn.Module):
 
             if i == 0:
                 self.decoder.append(DecoderBlock(filters[-i - 1], n_filters, apply_dropout=False,
-                                                 use_instance_norm=use_instance_norm))
+                                                 use_instance_norm=use_instance_norm,
+                                                 use_pixelTCL=use_pixelTCL))
             elif 1 <= i <= 2:
                 self.decoder.append(
                     DecoderBlock(2 * filters[-i - 1], n_filters, apply_dropout=False,
-                                 use_instance_norm=use_instance_norm))
+                                 use_instance_norm=use_instance_norm,
+                                 use_pixelTCL=use_pixelTCL))
             else:
                 self.decoder.append(DecoderBlock(2 * filters[-i - 1], n_filters,
-                                                 use_instance_norm=use_instance_norm))
+                                                 use_instance_norm=use_instance_norm,
+                                                 use_pixelTCL=use_pixelTCL))
 
     def forward(self, x):
 
@@ -181,46 +253,56 @@ class Generator(nn.Module):
 # TODO: make more generic (e.g. for different input sizes)
 class Discriminator(nn.Module):
     def __init__(self, leaky_relu_slope=0.2, in_channels=4, filters=(64, 128, 256, 512),
-                 use_instance_norm=False):
+                 use_instance_norm=False, disable_norm=False, network_type='model'):
         """
         Discriminator network
         :param leaky_relu_slope: slope of leaky ReLU
         :param in_channels: input channels, 4 for RGB + grayscale
         :param filters: number of filters in each layer
         :param use_instance_norm: use instance normalization if batch size is 1
+        :param disable_norm: disable normalization (for WGAN-GP)
+        :param network_type: type of discriminator network, 'patch_gan' or 'DCGAN'
         """
         super(Discriminator, self).__init__()
 
         self.leaky_relu_slope = leaky_relu_slope
         self.in_channels = in_channels
         self.filters = filters
+        assert network_type in ['patch_gan', 'DCGAN'], 'network_type must be either patch_gan or DCGAN'
+        self.network_type = network_type
 
-        self.patch_cnn = nn.ModuleList()
+        self.model = nn.ModuleList()
 
         for i, n_filters in enumerate(filters):
             if i == 0:
-                self.patch_cnn.append(EncoderBlock(in_channels, n_filters, kernel_size=4,
-                                                   batch_norm=False,
-                                                   leaky_relu_slope=leaky_relu_slope,
-                                                   use_instance_norm=use_instance_norm))
+                self.model.append(EncoderBlock(in_channels, n_filters, kernel_size=4,
+                                               batch_norm=False,
+                                               leaky_relu_slope=leaky_relu_slope,
+                                               use_instance_norm=use_instance_norm))
             elif 1 <= i <= 2:
-                self.patch_cnn.append(EncoderBlock(filters[i - 1], n_filters, kernel_size=4,
-                                                   leaky_relu_slope=leaky_relu_slope,
-                                                   use_instance_norm=use_instance_norm))
+                self.model.append(EncoderBlock(filters[i - 1], n_filters, kernel_size=4,
+                                               batch_norm=(not disable_norm),
+                                               leaky_relu_slope=leaky_relu_slope,
+                                               use_instance_norm=use_instance_norm))
             else:
-                self.patch_cnn.append(EncoderBlock(filters[i - 1], n_filters, kernel_size=4,
-                                                   stride=1, leaky_relu_slope=leaky_relu_slope,
-                                                   use_instance_norm=use_instance_norm))
+                self.model.append(EncoderBlock(filters[i - 1], n_filters, kernel_size=4,
+                                               batch_norm=(not disable_norm),
+                                               stride=1, leaky_relu_slope=leaky_relu_slope,
+                                               use_instance_norm=use_instance_norm))
 
-        last = nn.Conv2d(filters[-1], 1, kernel_size=4, stride=1, padding=1)
-        # initialize weights for last layer using xavier uniform
-        nn.init.xavier_uniform_(last.weight)
-        nn.init.constant_(last.bias, 0)
-        self.patch_cnn.append(last)
+        if self.network_type == 'patch_gan':
+            last = nn.Conv2d(filters[-1], 1, kernel_size=4, stride=1, padding=1)
+            # initialize weights for last layer using xavier uniform
+            nn.init.xavier_uniform_(last.weight)
+            nn.init.constant_(last.bias, 0)
+            self.model.append(last)
+        elif self.network_type == 'DCGAN':
+            self.model.append(nn.Flatten())
+            self.model.append(nn.LazyLinear(1))
 
     def forward(self, x):
-        for patch_cnn_step in self.patch_cnn:
-            x = patch_cnn_step(x)
+        for layer in self.model:
+            x = layer(x)
         return x
 
 
