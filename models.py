@@ -250,10 +250,10 @@ class Generator(nn.Module):
         return x
 
 
-# TODO: make more generic (e.g. for different input sizes)
+
 class Discriminator(nn.Module):
     def __init__(self, leaky_relu_slope=0.2, in_channels=4, filters=(64, 128, 256, 512),
-                 use_instance_norm=False, disable_norm=False, network_type='model'):
+                 use_instance_norm=False, disable_norm=False, network_type='patch_gan'):
         """
         Discriminator network
         :param leaky_relu_slope: slope of leaky ReLU
@@ -297,6 +297,7 @@ class Discriminator(nn.Module):
             nn.init.constant_(last.bias, 0)
             self.model.append(last)
         elif self.network_type == 'DCGAN':
+            self.model.append(nn.AdaptiveAvgPool2d(1))
             self.model.append(nn.Flatten())
             self.model.append(nn.LazyLinear(1))
 
